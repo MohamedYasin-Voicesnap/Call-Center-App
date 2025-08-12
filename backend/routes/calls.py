@@ -8,6 +8,7 @@ import io
 import csv
 import tempfile
 from openpyxl import load_workbook, Workbook
+import re
 
 calls_bp = Blueprint('calls', __name__)
 
@@ -232,6 +233,81 @@ def download_call_recording(current_user_id, call_id):
         if 'connection' in locals():
             connection.close()
 
+
+@calls_bp.route('/api/calls/upload-corrections', methods=['POST'])
+@token_required
+def upload_call_corrections(current_user_id):
+    """Accept JSON list of corrected rows and insert them.
+    Each item must include: agent_number, customer_number, name, remarks
+    """
+    try:
+        data = request.get_json() or {}
+        rows = data.get('rows', [])
+        if not isinstance(rows, list) or not rows:
+            return jsonify({'message': 'No rows provided'}), 400
+
+        connection = get_db_connection()
+        if connection is None:
+            return jsonify({'message': 'Database connection failed'}), 500
+        cursor = connection.cursor()
+
+        inserted = 0
+        errors = []
+        row_number = 1
+        for item in rows:
+            row_number += 1
+            effective_agent_number = str(item.get('agent_number', '')).strip()
+            customer_number_raw = str(item.get('customer_number', '')).strip()
+            name = str(item.get('name', '')).strip()
+            remarks = str(item.get('remarks', '')).strip()
+
+            if not effective_agent_number or not customer_number_raw:
+                errors.append({
+                    'row': row_number,
+                    'agent_number': effective_agent_number,
+                    'customer_number': customer_number_raw,
+                    'name': name,
+                    'remarks': remarks,
+                    'reason': 'Missing required agent_number or customer_number'
+                })
+                continue
+
+            digits_only = re.sub(r'\D', '', customer_number_raw)
+            if len(digits_only) != 10:
+                errors.append({
+                    'row': row_number,
+                    'agent_number': effective_agent_number,
+                    'customer_number': customer_number_raw,
+                    'name': name,
+                    'remarks': remarks,
+                    'reason': 'Customer number must be 10 digits'
+                })
+                continue
+
+            cursor.execute(
+                """
+                INSERT INTO calls (agent_number, customer_number, duration, call_status, timestamp, remarks, name, remarks_status)
+                VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)
+                """,
+                (effective_agent_number, digits_only, 0, 'Uploaded', remarks, name, '')
+            )
+            inserted += 1
+
+        connection.commit()
+        return jsonify({
+            'message': f'Processed corrections: {inserted} success, {len(errors)} errors',
+            'success_count': inserted,
+            'error_count': len(errors),
+            'errors': errors
+        }), 200
+    except Exception as e:
+        return jsonify({'message': f'Server error: {str(e)}'}), 500
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'connection' in locals():
+            connection.close()
+
 @calls_bp.route('/api/calls/<int:call_id>/recording', methods=['PUT'])
 @token_required
 def upload_call_recording(current_user_id, call_id):
@@ -264,24 +340,34 @@ def upload_call_recording(current_user_id, call_id):
 @calls_bp.route('/api/calls/upload-template', methods=['GET'])
 @token_required
 def download_calls_template(current_user_id):
-    """Provide an Excel template for uploading call details."""
+    """Provide an Excel template for uploading call details.
+
+    Columns included by default: agent_number, customer, name, remarks
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = 'CallsTemplate'
-    ws.append(['customer_number', 'name', 'remarks'])
-    # Add an example row (optional)
-    ws.append(['9876543210', 'Customer Name', 'Optional initial remark'])
+    # Header per requirement
+    ws.append(['agent_number', 'customer', 'name', 'remarks'])
+    # Example row (optional)
+    ws.append(['A001', '9876543210', 'Customer Name', 'Optional initial remark'])
     tmp = io.BytesIO()
     wb.save(tmp)
     tmp.seek(0)
-    return send_file(tmp, as_attachment=True, download_name='calls_upload_template.xlsx', mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    return send_file(
+        tmp,
+        as_attachment=True,
+        download_name='calls_upload_template.xlsx',
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
 
 @calls_bp.route('/api/calls/upload', methods=['POST'])
 @token_required
 def upload_calls_excel(current_user_id):
-    """Admin uploads calls for a specific agent; rows are created with status 'Uploaded'.
-    Expected form fields: agent_number, file (Excel .xlsx)
-    Columns: customer_number, name, remarks
+    """Admin uploads calls; rows are created with status 'Uploaded'.
+    Expected form fields: file (Excel .xlsx). Optional 'agent_number' for fallback.
+    Accepts spreadsheet columns: agent_number (per row), customer/customer_number, name, remarks.
+    If per-row agent_number is present, it overrides the form agent_number for that row.
     """
     try:
         # Ensure admin
@@ -298,9 +384,8 @@ def upload_calls_excel(current_user_id):
         if role != 'admin':
             return jsonify({'message': 'Unauthorized'}), 403
 
-        if 'agent_number' not in request.form:
-            return jsonify({'message': 'agent_number is required'}), 400
-        agent_number = request.form['agent_number']
+        # agent_number in form is optional now; used as fallback if row is missing it
+        agent_number = request.form.get('agent_number', '').strip()
         if 'file' not in request.files:
             return jsonify({'message': 'Excel file is required'}), 400
         f = request.files['file']
@@ -316,29 +401,93 @@ def upload_calls_excel(current_user_id):
         cursor = connection.cursor()
 
         inserted = 0
-        # Expect header row: customer_number, name, remarks
+        errors = []
+
+        # Build header index mapping (case-insensitive)
+        header_row = next(ws.iter_rows(values_only=True))
+        header_to_index = {}
+        if header_row:
+            for idx, header in enumerate(header_row):
+                key = str(header or '').strip().lower()
+                if key:
+                    header_to_index[key] = idx
+
+        # Resolve column indices with synonyms
+        idx_agent = header_to_index.get('agent_number')
+        idx_customer = (
+            header_to_index.get('customer')
+            if 'customer' in header_to_index
+            else header_to_index.get('customer_number')
+        )
+        idx_name = header_to_index.get('name')
+        idx_remarks = header_to_index.get('remarks')
+
+        # Iterate data rows
+        # Iterate from second row to keep the header reference intact
         first = True
+        row_number = 1
         for row in ws.iter_rows(values_only=True):
+            row_number += 1
             if first:
                 first = False
                 continue
             if not row:
                 continue
-            customer_number = (row[0] or '').strip() if isinstance(row[0], str) else str(row[0] or '').strip()
-            name = (row[1] or '').strip() if isinstance(row[1], str) else str(row[1] or '').strip()
-            remarks = (row[2] or '').strip() if isinstance(row[2], str) else str(row[2] or '').strip()
-            if not customer_number:
+
+            # Helper to safely get and normalize cell text
+            def cell_text(index):
+                if index is None or index >= len(row):
+                    return ''
+                value = row[index]
+                return (value or '').strip() if isinstance(value, str) else str(value or '').strip()
+
+            row_agent_number = cell_text(idx_agent) if idx_agent is not None else ''
+            effective_agent_number = row_agent_number or agent_number
+            customer_number = cell_text(idx_customer) if idx_customer is not None else cell_text(0)
+            name = cell_text(idx_name) if idx_name is not None else cell_text(1)
+            remarks = cell_text(idx_remarks) if idx_remarks is not None else cell_text(2)
+
+            # Validate required fields
+            # Validate required fields
+            if not effective_agent_number or not customer_number:
+                errors.append({
+                    'row': row_number,
+                    'agent_number': effective_agent_number,
+                    'customer_number': customer_number,
+                    'name': name,
+                    'remarks': remarks,
+                    'reason': 'Missing required agent_number or customer_number'
+                })
                 continue
+
+            # Ensure customer number is exactly 10 digits
+            digits_only = re.sub(r'\D', '', customer_number)
+            if len(digits_only) != 10:
+                errors.append({
+                    'row': row_number,
+                    'agent_number': effective_agent_number,
+                    'customer_number': customer_number,
+                    'name': name,
+                    'remarks': remarks,
+                    'reason': 'Customer number must be 10 digits'
+                })
+                continue
+
             cursor.execute(
                 """
                 INSERT INTO calls (agent_number, customer_number, duration, call_status, timestamp, remarks, name, remarks_status)
                 VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)
                 """,
-                (agent_number, customer_number, 0, 'Uploaded', remarks, name, '')
+                (effective_agent_number, digits_only, 0, 'Uploaded', remarks, name, '')
             )
             inserted += 1
         connection.commit()
-        return jsonify({'message': f'Uploaded {inserted} records successfully'}), 201
+        return jsonify({
+            'message': f'Processed file: {inserted} success, {len(errors)} errors',
+            'success_count': inserted,
+            'error_count': len(errors),
+            'errors': errors
+        }), 201
     except Exception as e:
         return jsonify({'message': f'Server error: {str(e)}'}), 500
     finally:

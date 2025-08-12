@@ -238,9 +238,8 @@ export const downloadCallsTemplate = async (token) => {
   return true;
 };
 
-export const uploadCallsExcel = async (agentNumber, file, token) => {
+export const uploadCallsExcel = async (file, token) => {
   const form = new FormData();
-  form.append('agent_number', agentNumber);
   form.append('file', file);
   try {
     const res = await fetch(`${API_BASE}/calls/upload`, {
@@ -251,6 +250,24 @@ export const uploadCallsExcel = async (agentNumber, file, token) => {
     const data = await res.json();
     if (res.ok) return { success: true, data };
     return { success: false, message: data.message || 'Upload failed' };
+  } catch (e) {
+    return { success: false, message: 'Network error' };
+  }
+};
+
+export const uploadCallCorrections = async (rows, token) => {
+  try {
+    const res = await fetch(`${API_BASE}/calls/upload-corrections`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ rows }),
+    });
+    const data = await res.json();
+    if (res.ok) return { success: true, data };
+    return { success: false, message: data.message || 'Correction upload failed' };
   } catch (e) {
     return { success: false, message: 'Network error' };
   }

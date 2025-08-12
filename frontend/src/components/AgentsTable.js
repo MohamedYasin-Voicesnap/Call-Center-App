@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Edit, Trash2, Plus, Download, Clock, Play, Pause, Eye, Upload } from 'lucide-react';
-import { downloadCallsTemplate, uploadCallsExcel } from '../utils/api';
+import { downloadCallsTemplate, uploadCallsExcel, uploadCallCorrections } from '../utils/api';
 import { agentStatusClass } from '../utils/format';
 import useAgents from '../hooks/useAgents';
 
@@ -45,9 +45,15 @@ const AgentsTable = ({
   const [selectedAgentNumber, setSelectedAgentNumber] = useState('');
   const [agentBreaksLoading, setAgentBreaksLoading] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
-  const [uploadForAgent, setUploadForAgent] = useState('');
   const [uploadFile, setUploadFile] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadErrors, setUploadErrors] = useState([]);
+  const [showCorrectionModal, setShowCorrectionModal] = useState(false);
+  const [correctionRows, setCorrectionRows] = useState([]);
+  const [correctionUploading, setCorrectionUploading] = useState(false);
+  const [showUploadResultModal, setShowUploadResultModal] = useState(false);
+  const [uploadSuccessCount, setUploadSuccessCount] = useState(0);
+  const [uploadErrorCount, setUploadErrorCount] = useState(0);
   const { saveAgentBreakStatus, closeLatestAgentBreak, getAllAgentBreaks, currentStatusMap, refreshAgentsCurrentStatus } = useAgents();
   const token = localStorage.getItem('token');
   const [breakTimeError, setBreakTimeError] = useState('');
@@ -292,7 +298,7 @@ const AgentsTable = ({
                 <Download className="w-4 h-4 mr-1" /> Template
               </button>
               <button
-                onClick={() => { setShowUploadModal(true); setUploadForAgent(''); setUploadFile(null); }}
+                onClick={() => { setShowUploadModal(true); setUploadFile(null); }}
                 className="flex items-center bg-purple-500 text-white px-3 py-1 rounded hover:bg-purple-600"
               >
                 <Upload className="w-4 h-4 mr-1" /> Upload Calls
@@ -519,10 +525,6 @@ const AgentsTable = ({
             <h3 className="text-lg font-bold mb-4">Upload Calls (Excel)</h3>
             <div className="space-y-3">
               <div>
-                <label className="block text-sm font-medium mb-1">Agent Number</label>
-                <input type="text" className="w-full border px-3 py-2 rounded" value={uploadForAgent} onChange={e => setUploadForAgent(e.target.value)} placeholder="e.g., A001" />
-              </div>
-              <div>
                 <label className="block text-sm font-medium mb-1">Excel File (.xlsx)</label>
                 <input type="file" accept=".xlsx" onChange={e => setUploadFile(e.target.files?.[0] || null)} />
               </div>
@@ -530,18 +532,33 @@ const AgentsTable = ({
                 <button className="flex-1 bg-gray-500 text-white py-2 rounded hover:bg-gray-600" onClick={() => setShowUploadModal(false)}>Cancel</button>
                 <button
                   className="flex-1 bg-purple-500 text-white py-2 rounded hover:bg-purple-600"
-                  disabled={!uploadForAgent || !uploadFile || uploading}
+                  disabled={!uploadFile || uploading}
                   onClick={async () => {
                     setUploading(true);
-                    const res = await uploadCallsExcel(uploadForAgent, uploadFile, token);
+                    const res = await uploadCallsExcel(uploadFile, token);
                     setUploading(false);
                     if (res.success) {
+                      const successCount = res.data?.success_count ?? 0;
+                      const errorCount = res.data?.error_count ?? 0;
+                      setUploadSuccessCount(successCount);
+                      setUploadErrorCount(errorCount);
                       setShowUploadModal(false);
-                      // Optional: notify admin and refresh calls list (if admin uploaded for self)
-                      alert(res.data?.message || 'Upload successful');
-                      if (user?.role === 'admin') {
-                        refreshCalls?.();
+                      if (errorCount > 0) {
+                        const errs = Array.isArray(res.data?.errors) ? res.data.errors : [];
+                        setUploadErrors(errs);
+                        setCorrectionRows(errs.map(e => ({
+                          agent_number: e.agent_number || '',
+                          customer_number: e.customer_number || '',
+                          name: e.name || '',
+                          remarks: e.remarks || '',
+                          reason: e.reason || '',
+                        })));
+                      } else {
+                        setUploadErrors([]);
+                        setCorrectionRows([]);
                       }
+                      setShowUploadResultModal(true);
+                      refreshCalls?.();
                     } else {
                       alert(res.message || 'Upload failed');
                     }
@@ -550,6 +567,48 @@ const AgentsTable = ({
                   {uploading ? 'Uploading...' : 'Upload'}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Upload Result Popup with left-bottom Correction button */}
+      {showUploadResultModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50">
+          <div className="relative bg-white rounded-lg shadow-lg p-6 w-full max-w-md">
+            <h3 className="text-lg font-bold mb-2">Upload Result</h3>
+            <p className="text-sm text-gray-700">Success: <span className="font-semibold">{uploadSuccessCount}</span></p>
+            <p className="text-sm text-gray-700 mb-6">Errors: <span className="font-semibold">{uploadErrorCount}</span></p>
+            {uploadErrorCount > 0 && (
+              <button
+                className="absolute left-4 bottom-4 bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600"
+                onClick={() => {
+                  const rows = (correctionRows || []).map(r => ({
+                    agent_number: r.agent_number || '',
+                    customer: r.customer_number || '',
+                    name: r.name || '',
+                    remarks: r.remarks || '',
+                    reason: r.reason || '',
+                  }));
+                  try {
+                    exportToExcel(rows, 'upload_errors');
+                  } catch (e) {
+                    console.error('Failed to export errors:', e);
+                    alert('Failed to export errors');
+                  }
+                }}
+                title="Download error rows for correction"
+              >
+                Correction ({uploadErrorCount})
+              </button>
+            )}
+            <div className="flex justify-end">
+              <button
+                className="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600"
+                onClick={() => setShowUploadResultModal(false)}
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>
@@ -735,6 +794,8 @@ const AgentsTable = ({
           </div>
         </div>
       )}
+
+      {/* Bottom-left floating Correction button removed as requested; popup button remains */}
     </div>
   );
 };
