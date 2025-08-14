@@ -18,12 +18,12 @@ import {
 } from './utils/exportHelpers';
 
 import { formatDuration, callStatusClass } from './utils/format';
-import { handleSaveAltNumbers, handleSaveViewAllRemarks } from './utils/api';
+import { handleSaveAltNumbers, handleSaveViewAllRemarks, fetchCompanyInfo } from './utils/api';
+import CompanyBlockedOverlay from './components/CompanyBlockedOverlay';
 
 function App() {
   // Auth
   const {
-    currentScreen,
     user,
     loginData,
     setLoginData,
@@ -34,6 +34,32 @@ function App() {
     setError,
   } = useAuth();
 
+  // UI States
+  const [currentScreen, setCurrentScreen] = useState('login');
+  const [activeTab, setActiveTab] = useState('calls');
+  const [callSearch, setCallSearch] = useState('');
+  const [agentSearch, setAgentSearch] = useState('');
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [showCallExport, setShowCallExport] = useState(false);
+  const [showAgentExport, setShowAgentExport] = useState(false);
+  console.log("App.js - initial showCallExport:", showCallExport);
+  console.log("App.js - initial showAgentExport:", showAgentExport);
+  const [blockedMessage, setBlockedMessage] = useState('');
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [formData, setFormData] = useState({ agent_number: '', name: '', email: '', password: '', status: 'Active', is_admin: false });
+  const [manualCallNumber, setManualCallNumber] = useState('');
+  const [viewCustomer, setViewCustomer] = useState(null);
+  const [viewAllRemarksEdit, setViewAllRemarksEdit] = useState(false);
+  const [viewAllRemarksInput, setViewAllRemarksInput] = useState('');
+  const [viewAllRemarksLoading, setViewAllRemarksLoading] = useState(false);
+  const [altModal, setAltModal] = useState(false);
+  const [selectedCall, setSelectedCall] = useState(null);
+  const [altNumbersInput, setAltNumbersInput] = useState('');
+  const [altNumbersLoading, setAltNumbersLoading] = useState(false);
+  const [company, setCompany] = useState(null); // Add company state
+
   // Agents
   const {
     agentDetails,
@@ -42,6 +68,7 @@ function App() {
     handleEditAgent,
     handleDeleteAgent,
     deleteLoading,
+    resetAgents,
   } = useAgents();
 
   // Calls
@@ -56,28 +83,8 @@ function App() {
     handleEditCall,
     handleCancelEdit,
     handleUpdateCall,
+    resetCalls,
   } = useCalls();
-
-  // UI States
-  const [activeTab, setActiveTab] = useState('calls');
-  const [callSearch, setCallSearch] = useState('');
-  const [agentSearch, setAgentSearch] = useState('');
-  const [fromDate, setFromDate] = useState('');
-  const [toDate, setToDate] = useState('');
-  const [showCallExport, setShowCallExport] = useState(false);
-  const [showAgentExport, setShowAgentExport] = useState(false);
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [showEditModal, setShowEditModal] = useState(false);
-  const [formData, setFormData] = useState({ agent_number: '', name: '', email: '', password: '', status: 'Active', is_admin: false });
-  const [manualCallNumber, setManualCallNumber] = useState('');
-  const [viewCustomer, setViewCustomer] = useState(null);
-  const [viewAllRemarksEdit, setViewAllRemarksEdit] = useState(false);
-  const [viewAllRemarksInput, setViewAllRemarksInput] = useState('');
-  const [viewAllRemarksLoading, setViewAllRemarksLoading] = useState(false);
-  const [altModal, setAltModal] = useState(false);
-  const [selectedCall, setSelectedCall] = useState(null);
-  const [altNumbersInput, setAltNumbersInput] = useState('');
-  const [altNumbersLoading, setAltNumbersLoading] = useState(false);
 
   const userRoleIsAdmin = user?.is_admin;
 
@@ -193,12 +200,48 @@ function App() {
         : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
     }`;
 
-  useEffect(() => {
-    if (user && token) {
+  const fetchCompanyInfoWithToken = async (token) => {
+    try {
+      const companyData = await fetchCompanyInfo(token);
+      setCompany(companyData); // Update company state
+      // Check for fully blocked statuses: 'Fully Close' or 'Unpaid'
+      if (companyData && (companyData.status === 'Fully Close' || companyData.payment_status === 'Unpaid')) {
+        const msg = 'Your services are stopped. Please contact the sales person.';
+        setBlockedMessage(msg);
+        console.log('Company is FULLY blocked, blockedMessage set to:', msg, 'Company status:', companyData.status, 'Payment status:', companyData.payment_status);
+        return; // do not fetch data and show full overlay
+      }
+      setBlockedMessage('');
+      console.log('Company is NOT FULLY blocked, blockedMessage set to empty.', 'Company status:', companyData?.status, 'Payment status:', companyData?.payment_status);
       fetchCallDetails(token);
       fetchAgentDetails(token);
+    } catch (err) {
+      console.error("Failed to fetch company info or other data:", err);
+      setError("Failed to load company data.");
     }
-  }, [user]);
+  };
+
+  useEffect(() => {
+    if (user && token) {
+      setCurrentScreen('dashboard');
+      // Set initial activeTab based on user role
+      if (user.role === 'master') {
+        setActiveTab('companies');
+      } else {
+        setActiveTab('calls');
+      }
+      // Ensure export dropdowns are closed by default on login/refresh
+      setShowCallExport(false);
+      setShowAgentExport(false);
+      fetchCompanyInfoWithToken(token);
+    }
+  }, [user, token]);
+
+  // Ensure export dropdowns are hidden when switching tabs
+  useEffect(() => {
+    setShowCallExport(false);
+    setShowAgentExport(false);
+  }, [activeTab]);
 
   if (currentScreen === 'login') {
     return (
@@ -208,6 +251,45 @@ function App() {
         handleLogin={handleLogin}
         loading={loading}
         error={error}
+      />
+    );
+  }
+
+  if (blockedMessage) {
+    return (
+      <CompanyBlockedOverlay
+        message={blockedMessage}
+        onLogout={() => {
+          handleLogout();
+          resetCalls();
+          resetAgents();
+          setCompany(null);
+          setBlockedMessage('');
+          setLoginData({ userId: '', password: '' });
+          setManualCallNumber('');
+          setViewCustomer(null);
+          setAltModal(false);
+          setSelectedCall(null);
+          setActiveTab('calls'); // Reset active tab to default
+          setCallSearch('');
+          setAgentSearch('');
+          setFromDate('');
+          setToDate('');
+          setShowCallExport(false);
+          setShowAgentExport(false);
+          setShowAddModal(false);
+          setShowEditModal(false);
+          setFormData({ agent_number: '', name: '', email: '', password: '', status: 'Active', is_admin: false });
+          setEditingCallId(null);
+          setEditInputs({});
+          setViewAllRemarksEdit(false);
+          setViewAllRemarksInput('');
+          setViewAllRemarksLoading(false);
+          setAltNumbersInput('');
+          setAltNumbersLoading('');
+          setCurrentScreen('login');
+        }}
+        user={user}
       />
     );
   }
@@ -241,7 +323,36 @@ function App() {
     <>
       <Dashboard
         user={user}
-        handleLogout={handleLogout}
+        handleLogout={() => {
+          handleLogout();
+          resetCalls();
+          resetAgents();
+          setCompany(null);
+          setBlockedMessage('');
+          setLoginData({ userId: '', password: '' });
+          setManualCallNumber('');
+          setViewCustomer(null);
+          setAltModal(false);
+          setSelectedCall(null);
+          setActiveTab('calls'); // Reset active tab to default
+          setCallSearch('');
+          setAgentSearch('');
+          setFromDate('');
+          setToDate('');
+          setShowCallExport(false);
+          setShowAgentExport(false);
+          setShowAddModal(false);
+          setShowEditModal(false);
+          setFormData({ agent_number: '', name: '', email: '', password: '', status: 'Active', is_admin: false });
+          setEditingCallId(null);
+          setEditInputs({});
+          setViewAllRemarksEdit(false);
+          setViewAllRemarksInput('');
+          setViewAllRemarksLoading(false);
+          setAltNumbersInput('');
+          setAltNumbersLoading('');
+          setCurrentScreen('login');
+        }}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         tabClass={tabClass}
@@ -299,6 +410,9 @@ function App() {
         manualCallNumber={manualCallNumber}
         setManualCallNumber={setManualCallNumber}
         handleManualCall={handleManualCall}
+        isBlocked={!!(company?.status === 'Fully Close' || company?.status === 'Partially Close' || company?.payment_status === 'Unpaid')}
+        // Pass the company object to Dashboard so it can pass to CompanyExportGuard
+        company={company}
       />
 
       <AddAgentModal

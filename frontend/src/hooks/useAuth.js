@@ -2,9 +2,8 @@ import { useState, useEffect } from 'react';
 import { handleLogin as apiHandleLogin } from '../utils/api';
 
 export default function useAuth() {
-  const [currentScreen, setCurrentScreen] = useState('login');
   const [user, setUser] = useState(null);
-  const [loginData, setLoginData] = useState({ userId: '', password: '' });
+  const [loginData, setLoginData] = useState({ userId: '', password: '', loginType: 'admin_or_agent' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -17,7 +16,7 @@ export default function useAuth() {
       try {
         const parsedUser = JSON.parse(storedUser);
         setUser(parsedUser);
-        setCurrentScreen('dashboard');
+        // setCurrentScreen('dashboard'); // This is a problem, will address in App.js
       } catch (err) {
         console.error('Invalid user data in localStorage');
         localStorage.removeItem('user');
@@ -37,7 +36,7 @@ export default function useAuth() {
       setUser(result.data.user);
       localStorage.setItem('token', result.data.token);
       localStorage.setItem('user', JSON.stringify(result.data.user));
-      setCurrentScreen('dashboard');
+      // setCurrentScreen('dashboard'); // This is a problem, will address in App.js
     } else {
       setError(result.message);
     }
@@ -47,15 +46,13 @@ export default function useAuth() {
 
   const handleLogout = () => {
     setUser(null);
-    setCurrentScreen('login');
+    // setCurrentScreen('login');
     localStorage.removeItem('token');
     localStorage.removeItem('user');
     setLoginData({ userId: '', password: '' });
   };
 
   return {
-    currentScreen,
-    setCurrentScreen,
     user,
     setUser,
     loginData,

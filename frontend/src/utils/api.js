@@ -319,3 +319,84 @@ export const closeLatestAgentBreak = async (agentNumber, breakEnd, token) => {
     return { success: false, message: 'Network error. Please try again.' };
   }
 };
+
+// Company info for admin/agent gating
+export const fetchCompanyInfo = async (token) => {
+  try {
+    const res = await fetch(`${API_BASE}/company`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    if (res.ok) {
+      return data.company || null;
+    }
+  } catch (e) {}
+  return null;
+};
+
+// Master: list companies created by master
+export const fetchMasterCompanies = async (token) => {
+  try {
+    const res = await fetch(`${API_BASE}/master/companies`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    if (res.ok) {
+      return data.companies || [];
+    }
+  } catch (e) {}
+  return [];
+};
+
+// Master: create company
+export const createCompany = async (form, token) => {
+  try {
+    const res = await fetch(`${API_BASE}/master/companies`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(form),
+    });
+    const data = await res.json();
+    if (res.ok) return { success: true, data };
+    return { success: false, message: data.message || 'Failed to create company' };
+  } catch (e) {
+    return { success: false, message: 'Network error' };
+  }
+};
+
+// Master: update company
+export const updateCompany = async (companyId, form, token) => {
+  try {
+    const res = await fetch(`${API_BASE}/master/companies/${companyId}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(form),
+    });
+    const data = await res.json();
+    if (res.ok) return { success: true, data };
+    return { success: false, message: data.message || 'Failed to update company' };
+  } catch (e) {
+    return { success: false, message: 'Network error' };
+  }
+};
+
+// Master: stop company service
+export const stopCompany = async (companyId, token) => {
+  try {
+    const res = await fetch(`${API_BASE}/master/companies/${companyId}/stop`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    if (res.ok) return { success: true, data };
+    return { success: false, message: data.message || 'Failed to stop company' };
+  } catch (e) {
+    return { success: false, message: 'Network error' };
+  }
+};

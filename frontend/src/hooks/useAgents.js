@@ -76,6 +76,12 @@ export default function useAgents() {
     return await fetchAllAgentBreaks(token, search);
   };
 
+  const resetAgents = () => {
+    setAgentDetails([]);
+    setDeleteLoading(false);
+    setCurrentStatusMap({});
+  };
+
   return {
     agentDetails,
     setAgentDetails,
@@ -89,6 +95,7 @@ export default function useAgents() {
     setDeleteLoading,
     saveAgentBreakStatus,
     closeLatestAgentBreak,
-    getAllAgentBreaks
+    getAllAgentBreaks,
+    resetAgents
   };
 }

@@ -12,7 +12,8 @@ const MissedCallsTable = ({
   editLoading,
   formatDuration,
   callStatusClass,
-  handleOpenAltNumbersModal
+  handleOpenAltNumbersModal,
+  isBlocked // Accept the isBlocked prop
 }) => {
   // Helper to get latest missed/failed calls by customer
   const getLatestMissedCallsByCustomer = (calls) => {
@@ -81,7 +82,16 @@ const MissedCallsTable = ({
           </tr>
         </thead>
         <tbody className="bg-white divide-y divide-gray-200">
-          {getLatestCallsByCustomer(callDetails.filter(call => call.call_status === 'Missed' || call.call_status === 'Failed' || call.call_status === 'Uploaded')).map((call) => {
+          {(() => {
+            const rows = getLatestCallsByCustomer(callDetails.filter(call => call.call_status === 'Missed' || call.call_status === 'Failed' || call.call_status === 'Uploaded'));
+            if (!rows.length) {
+              return (
+                <tr>
+                  <td className="px-6 py-8 text-center text-sm text-gray-500" colSpan={10}>No records found</td>
+                </tr>
+              );
+            }
+            return rows.map((call) => {
             const dateObj = new Date(call.timestamp);
             const date = dateObj.toLocaleDateString();
             const time = dateObj.toLocaleTimeString();
@@ -142,13 +152,14 @@ const MissedCallsTable = ({
                   )}
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap text-sm">
-                <a
-                    href={`sip:${call.customer_number}@192.168.31.22`}
-                    className="ml-2 text-green-600 hover:underline"
+                <button
+                    onClick={() => alert(`Pretend calling ${call.customer_number}`)}
+                    className="ml-2 text-green-600 hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
                     style={{ marginLeft: 8 }}
+                    disabled={isBlocked}
                   >
                      <Phone size={16} />
-                  </a>
+                  </button>
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap text-sm">
                 <div className="flex gap-2">
@@ -183,7 +194,8 @@ const MissedCallsTable = ({
                 </td>
               </tr>
             );
-          })}
+          });
+          })()}
         </tbody>
       </table>
     </div>

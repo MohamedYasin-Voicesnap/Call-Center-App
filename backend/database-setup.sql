@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS calls (
     remarks TEXT,
     name TEXT,
     remarks_status TEXT,
+    recordings LONGBLOB,
+    alternative_numbers TEXT,
     meeting_datetime DATETIME NULL,
     meeting_description TEXT,
     FOREIGN KEY (agent_number) REFERENCES agents(agent_number)

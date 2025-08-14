@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Download, Phone, Play as PlayIcon, Pause as PauseIcon, Loader2 } from 'lucide-react';
+import CompanyExportGuard from './CompanyExportGuard';
 import { getLatestCallsByCustomer } from '../utils/format';
 import { handleUpdateMeeting, fetchCallRecordingUrl } from '../utils/api';
 const CallsTable = ({
@@ -27,8 +28,10 @@ const CallsTable = ({
   formatDuration,
   callStatusClass,
   handleViewCustomerCalls,
-  handleOpenAltNumbersModal
+  handleOpenAltNumbersModal,
+  isBlocked
 }) => {
+  console.log("CallsTable.js - showCallExport prop on render:", showCallExport);
   const parseRemarks = (remarksHtml) => {
     if (!remarksHtml) return [];
     const parts = remarksHtml
@@ -67,6 +70,23 @@ const CallsTable = ({
   const [playingById, setPlayingById] = useState({});
   const [progressById, setProgressById] = useState({});
   const audioRefs = React.useRef({});
+
+  const exportDropdownRef = useRef(null);
+
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (exportDropdownRef.current && !exportDropdownRef.current.contains(event.target)) {
+        console.log("CallsTable.js - handleClickOutside: Closing dropdown");
+        setShowCallExport(false);
+      }
+    }
+    // Bind the event listener
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      // Unbind the event listener on clean up
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [exportDropdownRef, setShowCallExport]);
 
   const formatTime = (sec = 0) => {
     const s = Math.floor(sec % 60).toString().padStart(2, '0');
@@ -118,19 +138,24 @@ const CallsTable = ({
         <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} className="border px-2 py-1 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs" style={{ width: 120 }} title="To date" />
         <button className="bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600 ml-2" onClick={handleDateSearch} style={{ minWidth: 90 }}>Search</button>
         <input type="text" placeholder="Search calls..." value={callSearch} onChange={e => setCallSearch(e.target.value)} className="border px-3 py-1 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 ml-4" style={{ width: 180 }} />
-        <div className="relative ml-2">
-          <button onClick={() => setShowCallExport(v => !v)} className="flex items-center bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600" style={{ minWidth: 90 }}>
-            <Download className="w-4 h-4 mr-1" /> Export
-          </button>
-          {showCallExport && (
-            <div className="absolute right-0 mt-2 w-32 bg-white border rounded shadow z-10">
-              <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToExcel(filteredCalls, 'calls'); setShowCallExport(false); }}>Excel</button>
-              <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToPDF(filteredCalls, 'calls', ['agent_number','customer_number','duration','call_status','timestamp']); setShowCallExport(false); }}>PDF</button>
-              <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToCSV(filteredCalls, 'calls'); setShowCallExport(false); }}>CSV</button>
-              <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToXML(filteredCalls, 'calls'); setShowCallExport(false); }}>XML</button>
-            </div>
-          )}
-        </div>
+        <CompanyExportGuard isBlocked={isBlocked}>
+          <div className="relative ml-2" ref={exportDropdownRef}>
+            <button onClick={() => {
+              console.log("CallsTable.js - Export button clicked. Current showCallExport:", showCallExport);
+              setShowCallExport(v => !v);
+            }} className="flex items-center bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600" style={{ minWidth: 90 }}>
+              <Download className="w-4 h-4 mr-1" /> Export
+            </button>
+            {showCallExport && (
+              <div className="absolute right-0 mt-2 w-32 bg-white border rounded shadow z-10">
+                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToExcel(filteredCalls, 'calls'); setShowCallExport(false); }}>Excel</button>
+                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToPDF(filteredCalls, 'calls', ['agent_number','customer_number','duration','call_status','timestamp']); setShowCallExport(false); }}>PDF</button>
+                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToCSV(filteredCalls, 'calls'); setShowCallExport(false); }}>CSV</button>
+                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToXML(filteredCalls, 'calls'); setShowCallExport(false); }}>XML</button>
+              </div>
+            )}
+          </div>
+        </CompanyExportGuard>
       </div>
     </div>
     {/* Table rendering will be filled in next modularization step */}
@@ -157,7 +182,16 @@ const CallsTable = ({
   </tr>
 </thead>
 <tbody className="bg-white divide-y divide-gray-200">
-{getLatestCallsByCustomer(filteredCalls.filter(call => call.call_status === 'Completed')).map((call) => {
+{(() => {
+  const rows = getLatestCallsByCustomer(filteredCalls.filter(call => call.call_status === 'Completed'));
+  if (!rows.length) {
+    return (
+      <tr>
+        <td className="px-6 py-8 text-center text-sm text-gray-500" colSpan={13}>No records found</td>
+      </tr>
+    );
+  }
+  return rows.map((call) => {
   const dateObj = new Date(call.timestamp);
   const date = dateObj.toLocaleDateString();
   const time = dateObj.toLocaleTimeString();
@@ -341,13 +375,14 @@ const CallsTable = ({
         )}
       </td>
       <td className="px-6 py-4 whitespace-nowrap text-sm">
-      <a
-          href={`sip:${call.customer_number}@192.168.31.22`}
-          className="ml-2 text-green-600 hover:underline"
+      <button
+          onClick={() => alert(`Pretend calling ${call.customer_number}`)}
+          className="ml-2 text-green-600 hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
           style={{ marginLeft: 8 }}
+          disabled={isBlocked}
         >
             <Phone size={16} />
-        </a>
+        </button>
       </td>
       <td className="px-6 py-4 whitespace-nowrap text-sm">    
       <button
@@ -385,7 +420,8 @@ const CallsTable = ({
                   </td>
                 </tr>
               );
-            })}
+            });
+})()}
 </tbody>
 
               </table>

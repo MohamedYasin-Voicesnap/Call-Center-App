@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Edit, Trash2, Plus, Download, Clock, Play, Pause, Eye, Upload } from 'lucide-react';
+import CompanyExportGuard from './CompanyExportGuard';
 import { downloadCallsTemplate, uploadCallsExcel, uploadCallCorrections } from '../utils/api';
 import { agentStatusClass } from '../utils/format';
 import useAgents from '../hooks/useAgents';
@@ -30,7 +31,8 @@ const AgentsTable = ({
   handleAddAgent,
   handleEditAgent,
   loading,
-  error
+  error,
+  isBlocked
 }) => {
   const [workingStatus, setWorkingStatus] = useState('Working');
   const [breakData, setBreakData] = useState({
@@ -238,6 +240,22 @@ const AgentsTable = ({
     }, 0);
   };
 
+  const exportDropdownRef = React.useRef(null);
+
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (exportDropdownRef.current && !exportDropdownRef.current.contains(event.target)) {
+        setShowAgentExport(false);
+      }
+    }
+    // Bind the event listener
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      // Unbind the event listener on clean up
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [exportDropdownRef, setShowAgentExport]);
+
   return (
     <div className="bg-white shadow rounded-lg">
       <div className="px-6 py-4 border-b border-gray-200 flex flex-col sm:flex-row sm:items-center sm:justify-between">
@@ -270,22 +288,24 @@ const AgentsTable = ({
           )}
 
           {/* Export Dropdown */}
-          <div className="relative">
-            <button
-              onClick={() => setShowAgentExport(v => !v)}
-              className="flex items-center bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600"
-            >
-              <Download className="w-4 h-4 mr-1" /> Export
-            </button>
-            {showAgentExport && (
-              <div className="absolute right-0 mt-2 w-32 bg-white border rounded shadow z-10">
-                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToExcel(displayAgents, 'agents'); setShowAgentExport(false); }}>Excel</button>
-                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToPDF(displayAgents, 'agents', ['agent_number','name','email','status','is_admin']); setShowAgentExport(false); }}>PDF</button>
-                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToCSV(displayAgents, 'agents'); setShowAgentExport(false); }}>CSV</button>
-                <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToXML(displayAgents, 'agents'); setShowAgentExport(false); }}>XML</button>
-              </div>
-            )}
-          </div>
+          <CompanyExportGuard isBlocked={isBlocked}>
+            <div className="relative" ref={exportDropdownRef}>
+              <button
+                onClick={() => setShowAgentExport(v => !v)}
+                className="flex items-center bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600"
+              >
+                <Download className="w-4 h-4 mr-1" /> Export
+              </button>
+              {showAgentExport && (
+                <div className="absolute right-0 mt-2 w-32 bg-white border rounded shadow z-10">
+                  <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToExcel(displayAgents, 'agents'); setShowAgentExport(false); }}>Excel</button>
+                  <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToPDF(displayAgents, 'agents', ['agent_number','name','email','status','is_admin']); setShowAgentExport(false); }}>PDF</button>
+                  <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToCSV(displayAgents, 'agents'); setShowAgentExport(false); }}>CSV</button>
+                  <button className="block w-full text-left px-4 py-2 hover:bg-gray-100" onClick={() => { exportToXML(displayAgents, 'agents'); setShowAgentExport(false); }}>XML</button>
+                </div>
+              )}
+            </div>
+          </CompanyExportGuard>
 
           {user?.role === 'admin' && (
             <div className="flex items-center gap-2">
@@ -294,12 +314,14 @@ const AgentsTable = ({
                   await downloadCallsTemplate(token);
                 }}
                 className="flex items-center bg-gray-100 px-3 py-1 rounded hover:bg-gray-200"
+                disabled={isBlocked}
               >
                 <Download className="w-4 h-4 mr-1" /> Template
               </button>
               <button
                 onClick={() => { setShowUploadModal(true); setUploadFile(null); }}
                 className="flex items-center bg-purple-500 text-white px-3 py-1 rounded hover:bg-purple-600"
+                disabled={isBlocked}
               >
                 <Upload className="w-4 h-4 mr-1" /> Upload Calls
               </button>
@@ -322,6 +344,7 @@ const AgentsTable = ({
                 setError('');
               }}
               className="flex items-center bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600"
+              disabled={isBlocked}
             >
               <Plus className="w-4 h-4 mr-1" /> Add Agent
             </button>
@@ -580,18 +603,58 @@ const AgentsTable = ({
             <p className="text-sm text-gray-700">Success: <span className="font-semibold">{uploadSuccessCount}</span></p>
             <p className="text-sm text-gray-700 mb-6">Errors: <span className="font-semibold">{uploadErrorCount}</span></p>
             {uploadErrorCount > 0 && (
-              <button
+              <div className="mb-4 max-h-48 overflow-y-auto border border-gray-200 p-2 rounded">
+                <p className="font-semibold mb-2">Error Details:</p>
+                {correctionRows && correctionRows.length > 0 ? (
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Row Number</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Reason</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Agent Number</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Customer Number</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Remarks</th>
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-200">
+                        {correctionRows.map((row, index) => (
+                          <tr key={index} className="text-gray-900">
+                            <td className="px-4 py-2 whitespace-nowrap text-sm">{row.row_number || index + 1}</td>
+                            <td className="px-4 py-2 whitespace-nowrap text-sm">{row.reason || 'N/A'}</td>
+                            <td className="px-4 py-2 whitespace-nowrap text-sm">{row.agent_number || 'N/A'}</td>
+                            <td className="px-4 py-2 whitespace-nowrap text-sm">{row.customer_number || 'N/A'}</td>
+                            <td className="px-4 py-2 whitespace-nowrap text-sm">{row.name || 'N/A'}</td>
+                            <td className="px-4 py-2 whitespace-nowrap text-sm">{row.remarks || 'N/A'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-500">No specific error details available.</p>
+                )}
+              </div>
+            )}
+            <button
                 className="absolute left-4 bottom-4 bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600"
                 onClick={() => {
-                  const rows = (correctionRows || []).map(r => ({
-                    agent_number: r.agent_number || '',
-                    customer: r.customer_number || '',
-                    name: r.name || '',
-                    remarks: r.remarks || '',
-                    reason: r.reason || '',
-                  }));
+                  const rowsToExport = (correctionRows || []).map(r => {
+                    const exportedRow = {
+                      'Row Number': r.row_number || correctionRows.indexOf(r) + 1,
+                      'Reason': r.reason || '',
+                    };
+                    for (const key in r) {
+                      if (key !== 'reason' && key !== 'row_number') {
+                        exportedRow[key.replace(/_/g, ' ').split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ')] = r[key];
+                      }
+                    }
+                    return exportedRow;
+                  });
+                  console.log('Error Rows for Export:', rowsToExport);
                   try {
-                    exportToExcel(rows, 'upload_errors');
+                    exportToExcel(rowsToExport, 'upload_errors_report');
                   } catch (e) {
                     console.error('Failed to export errors:', e);
                     alert('Failed to export errors');
@@ -599,9 +662,8 @@ const AgentsTable = ({
                 }}
                 title="Download error rows for correction"
               >
-                Correction ({uploadErrorCount})
+                Download ({uploadErrorCount})
               </button>
-            )}
             <div className="flex justify-end">
               <button
                 className="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600"

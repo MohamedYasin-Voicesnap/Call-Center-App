@@ -10,7 +10,16 @@ const AddAgentModal = ({ show, onClose, formData, setFormData, handleAddAgent, l
         <form className="space-y-4" onSubmit={handleAddAgent}>
           <div>
             <label className="block text-sm font-medium mb-1">Agent Number</label>
-            <input type="text" className="w-full border px-3 py-2 rounded" value={formData.agent_number} onChange={e => setFormData({ ...formData, agent_number: e.target.value })} required />
+            <input
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]{10}"
+              className="w-full border px-3 py-2 rounded"
+              value={formData.agent_number}
+              onChange={e => setFormData({ ...formData, agent_number: (e.target.value || '').replace(/\D+/g, '') })}
+              placeholder="10-digit mobile (e.g., 9876543210)"
+              required
+            />
           </div>
           <div>
             <label className="block text-sm font-medium mb-1">Name</label>

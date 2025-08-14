@@ -1,8 +1,11 @@
 from flask import Blueprint, request, jsonify ,current_app
 from backend.db.connection import get_db_connection
+from backend.db.company_tables import get_company_table_name
 from backend.auth.jwt_utils import token_required
 from mysql.connector import Error, errorcode
 from datetime import datetime
+from backend.db.company_tables import ensure_agents_mapping_index
+import re
 
 agents_bp = Blueprint('agents', __name__)
 
@@ -14,8 +17,30 @@ def get_agents(current_user_id):
         connection = get_db_connection()
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
+        # Company isolation
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        role = data.get('role', 'admin')
+        company_id = data.get('company_id')
         cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT id, agent_number, name, email, password, status, is_admin FROM agents ORDER BY agent_number")
+        if role in ('admin', 'agent') and company_id:
+            # Deny access if company is disabled or unpaid
+            st = connection.cursor(dictionary=True)
+            st.execute("SELECT status, payment_status FROM companies WHERE id = %s", (company_id,))
+            row = st.fetchone()
+            if row and (row.get('status') == 'Fully Close' or row.get('payment_status') == 'Unpaid'):
+                return jsonify({'message': 'Access disabled for this company'}), 403
+            table = get_company_table_name('agents', int(company_id))
+            cursor.execute(f"SELECT id, agent_number, name, email, password, status, is_admin FROM `{table}` ORDER BY agent_number")
+        else:
+            cursor.execute("SELECT id, agent_number, name, email, password, status, is_admin FROM agents ORDER BY agent_number")
         agents = cursor.fetchall()
         return jsonify({'agents': agents}), 200
     except Exception as e:
@@ -42,6 +67,7 @@ def add_agent(current_user_id):
         import jwt
         data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
         role = data.get('role', 'admin')
+        company_id = data.get('company_id')
         if role != 'admin':
             return jsonify({'message': 'Unauthorized'}), 403
         
@@ -54,14 +80,35 @@ def add_agent(current_user_id):
         is_admin = req.get('is_admin', False)
         if not agent_number or not name or not email or not password:
             return jsonify({'message': 'Missing required fields'}), 400
+        # Enforce numeric-only agent_number
+        if not isinstance(agent_number, str):
+            agent_number = str(agent_number)
+        if not re.fullmatch(r"\d+", agent_number):
+            return jsonify({'message': 'Agent number must be numeric'}), 400
         connection = get_db_connection()
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor()
-        cursor.execute("""
-            INSERT INTO agents (agent_number, name, email, password, status, is_admin)
+        # Attach company_id to the created agent (scopes to logged-in admin's company)
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'agents' AND COLUMN_NAME = 'company_id'
+            """)
+            has_company = cursor.fetchone()[0] > 0
+        except Exception:
+            has_company = False
+        # Insert into per-company table first
+        table = get_company_table_name('agents', int(company_id))
+        cursor.execute(
+            f"""
+            INSERT INTO `{table}` (agent_number, name, email, password, status, is_admin)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """, (agent_number, name, email, password, status, is_admin))
+            """,
+            (agent_number, name, email, password, status, is_admin)
+        )
+
+        # Do not write to shared 'agents' mapping to avoid index conflicts
         connection.commit()
         return jsonify({'message': 'Agent added successfully'}), 201
     except Error as e:
@@ -105,6 +152,7 @@ def edit_agent(current_user_id, agent_number):
         import jwt
         data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
         role = data.get('role', 'admin')
+        company_id = data.get('company_id')
         token_agent_number = data.get('agent_number')
 
         req = request.get_json()
@@ -140,9 +188,14 @@ def edit_agent(current_user_id, agent_number):
                 params.append(is_admin)
             if not update_fields:
                 return jsonify({'message': 'No fields to update'}), 400
-            params.append(agent_number)
-            sql = f"UPDATE agents SET {', '.join(update_fields)} WHERE agent_number = %s"
-            cursor.execute(sql, tuple(params))
+            # First update per-company table
+            params_per = params.copy()
+            params_per.append(agent_number)
+            table = get_company_table_name('agents', int(company_id))
+            sql_per = f"UPDATE `{table}` SET {', '.join(update_fields)} WHERE agent_number = %s"
+            cursor.execute(sql_per, tuple(params_per))
+
+            # No shared 'agents' update
             connection.commit()
             return jsonify({'message': 'Agent updated successfully'}), 200
 
@@ -182,13 +235,18 @@ def delete_agent(current_user_id, agent_number):
         import jwt
         data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
         role = data.get('role', 'admin')
+        company_id = data.get('company_id')
         if role != 'admin':
             return jsonify({'message': 'Unauthorized'}), 403
         connection = get_db_connection()
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor()
-        cursor.execute("DELETE FROM agents WHERE agent_number = %s", (agent_number,))
+        # Delete from per-company table first
+        table = get_company_table_name('agents', int(company_id))
+        cursor.execute(f"DELETE FROM `{table}` WHERE agent_number = %s", (agent_number,))
+
+        # No shared 'agents' delete
         connection.commit()
         return jsonify({'message': 'Agent deleted successfully'}), 200
     except Error as e:
@@ -219,10 +277,36 @@ def add_agent_break(current_user_id):
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor()
-        cursor.execute("""
-            INSERT INTO agent_breaks (agent_number, status, break_start, break_end, duration_seconds, remark)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (agent_number, status, break_start, break_end, duration_seconds, remark))
+        # Resolve company_id from JWT
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        jwt_data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        company_id = jwt_data.get('company_id')
+
+        # Write to per-company breaks table when company_id is present; fallback to shared table
+        if company_id:
+            table = get_company_table_name('agent_breaks', int(company_id))
+            cursor.execute(
+                f"""
+                INSERT INTO `{table}` (agent_number, status, break_start, break_end, duration_seconds, remark)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (agent_number, status, break_start, break_end, duration_seconds, remark)
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO agent_breaks (agent_number, status, break_start, break_end, duration_seconds, remark)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (agent_number, status, break_start, break_end, duration_seconds, remark)
+            )
         connection.commit()
         return jsonify({'message': 'Break/working status recorded successfully'}), 201
     except Error as e:
@@ -253,30 +337,65 @@ def close_latest_agent_break(current_user_id):
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor(dictionary=True)
-        # Find latest break with no end
-        cursor.execute(
-            """
-            SELECT id, break_start FROM agent_breaks
-            WHERE agent_number = %s AND status = 'Break' AND break_end IS NULL
-            ORDER BY break_start DESC
-            LIMIT 1
-            """,
-            (agent_number,)
-        )
+        # Resolve company_id from JWT
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        jwt_data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        company_id = jwt_data.get('company_id')
+
+        # Determine per-company table
+        if company_id:
+            table = get_company_table_name('agent_breaks', int(company_id))
+            cursor.execute(
+                f"""
+                SELECT id, break_start FROM `{table}`
+                WHERE agent_number = %s AND status = 'Break' AND break_end IS NULL
+                ORDER BY break_start DESC
+                LIMIT 1
+                """,
+                (agent_number,)
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, break_start FROM agent_breaks
+                WHERE agent_number = %s AND status = 'Break' AND break_end IS NULL
+                ORDER BY break_start DESC
+                LIMIT 1
+                """,
+                (agent_number,)
+            )
         row = cursor.fetchone()
         if not row:
             return jsonify({'message': 'No ongoing break found'}), 404
         # Update with break_end and duration in seconds
         cursor2 = connection.cursor()
-        cursor2.execute(
-            """
-            UPDATE agent_breaks
-            SET break_end = %s,
-                duration_seconds = TIMESTAMPDIFF(SECOND, break_start, %s)
-            WHERE id = %s
-            """,
-            (break_end, break_end, row['id'])
-        )
+        if company_id:
+            cursor2.execute(
+                f"""
+                UPDATE `{table}`
+                SET break_end = %s,
+                    duration_seconds = TIMESTAMPDIFF(SECOND, break_start, %s)
+                WHERE id = %s
+                """,
+                (break_end, break_end, row['id'])
+            )
+        else:
+            cursor2.execute(
+                """
+                UPDATE agent_breaks
+                SET break_end = %s,
+                    duration_seconds = TIMESTAMPDIFF(SECOND, break_start, %s)
+                WHERE id = %s
+                """,
+                (break_end, break_end, row['id'])
+            )
         connection.commit()
         return jsonify({'message': 'Break closed successfully'}), 200
     except Error as e:
@@ -313,13 +432,23 @@ def get_agent_breaks(current_user_id):
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor(dictionary=True)
-        query = """
-            SELECT ab.*, a.name, a.email FROM agent_breaks ab
-            JOIN agents a ON ab.agent_number = a.agent_number
-        """
+        # Build query once, using per-company tables when available
+        company_id = data.get('company_id', 0) or 0
         params = []
+        if company_id:
+            breaks_table = get_company_table_name('agent_breaks', int(company_id))
+            agents_table = get_company_table_name('agents', int(company_id))
+            query = (
+                f"SELECT ab.*, a.name, a.email FROM `{breaks_table}` ab "
+                f"JOIN `{agents_table}` a ON ab.agent_number = a.agent_number"
+            )
+        else:
+            query = (
+                "SELECT ab.*, a.name, a.email FROM agent_breaks ab "
+                "JOIN agents a ON ab.agent_number = a.agent_number"
+            )
         if search:
-            query += " WHERE a.name LIKE %s OR ab.agent_number LIKE %s "
+            query += " WHERE a.name LIKE %s OR ab.agent_number LIKE %s"
             params.extend([f"%{search}%", f"%{search}%"])
         query += " ORDER BY ab.break_start DESC"
         cursor.execute(query, tuple(params))
@@ -366,31 +495,59 @@ def get_agents_current_status(current_user_id):
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor(dictionary=True)
 
-        # Build query: latest break/work row per agent
-        base = """
-            SELECT a.agent_number,
-                   CASE WHEN ab.status = 'Break' AND ab.break_end IS NULL THEN 'Break' ELSE 'Working' END AS current_status,
-                   ab.break_start,
-                   ab.break_end
-            FROM agents a
-            LEFT JOIN (
-                SELECT x.* FROM agent_breaks x
-                JOIN (
-                    SELECT agent_number, MAX(COALESCE(break_start, created_at)) AS max_dt
-                    FROM agent_breaks
-                    GROUP BY agent_number
-                ) m ON m.agent_number = x.agent_number AND COALESCE(x.break_start, x.created_at) = m.max_dt
-            ) ab ON ab.agent_number = a.agent_number
-        """
-        params = []
-        if role == 'agent' and token_agent_number:
-            base += " WHERE a.agent_number = %s"
-            params.append(token_agent_number)
-        elif role == 'admin':
-            # For admin view: exclude inactive agents and admin accounts from current status mapping
-            base += " WHERE a.status = 'Active' AND a.is_admin = 0"
-        base += " ORDER BY a.agent_number"
-        cursor.execute(base, tuple(params))
+        # If tenant context, read from per-company tables
+        if role in ('admin', 'agent') and data.get('company_id'):
+            company_id = data.get('company_id')
+            agents_table = get_company_table_name('agents', int(company_id))
+            breaks_table = get_company_table_name('agent_breaks', int(company_id))
+            base = f"""
+                SELECT a.agent_number,
+                       CASE WHEN ab.status = 'Break' AND ab.break_end IS NULL THEN 'Break' ELSE 'Working' END AS current_status,
+                       ab.break_start,
+                       ab.break_end
+                FROM `{agents_table}` a
+                LEFT JOIN (
+                    SELECT x.* FROM `{breaks_table}` x
+                    JOIN (
+                        SELECT agent_number, MAX(COALESCE(break_start, created_at)) AS max_dt
+                        FROM `{breaks_table}`
+                        GROUP BY agent_number
+                    ) m ON m.agent_number = x.agent_number AND COALESCE(x.break_start, x.created_at) = m.max_dt
+                ) ab ON ab.agent_number = a.agent_number
+            """
+            params = []
+            if role == 'agent' and token_agent_number:
+                base += " WHERE a.agent_number = %s"
+                params.append(token_agent_number)
+            elif role == 'admin':
+                base += " WHERE a.status = 'Active' AND a.is_admin = 0"
+            base += " ORDER BY a.agent_number"
+            cursor.execute(base, tuple(params))
+        else:
+            # Fallback to shared tables
+            base = """
+                SELECT a.agent_number,
+                       CASE WHEN ab.status = 'Break' AND ab.break_end IS NULL THEN 'Break' ELSE 'Working' END AS current_status,
+                       ab.break_start,
+                       ab.break_end
+                FROM agents a
+                LEFT JOIN (
+                    SELECT x.* FROM agent_breaks x
+                    JOIN (
+                        SELECT agent_number, MAX(COALESCE(break_start, created_at)) AS max_dt
+                        FROM agent_breaks
+                        GROUP BY agent_number
+                    ) m ON m.agent_number = x.agent_number AND COALESCE(x.break_start, x.created_at) = m.max_dt
+                ) ab ON ab.agent_number = a.agent_number
+            """
+            params = []
+            if role == 'agent' and token_agent_number:
+                base += " WHERE a.agent_number = %s"
+                params.append(token_agent_number)
+            elif role == 'admin':
+                base += " WHERE a.status = 'Active' AND a.is_admin = 0"
+            base += " ORDER BY a.agent_number"
+            cursor.execute(base, tuple(params))
         rows = cursor.fetchall()
         # Return as mapping agent_number -> status
         mapping = {row['agent_number']: row['current_status'] for row in rows}

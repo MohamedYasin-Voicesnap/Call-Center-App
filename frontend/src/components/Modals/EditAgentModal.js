@@ -12,7 +12,14 @@ const EditAgentModal = ({ show, onClose, formData, setFormData, handleEditAgent,
             <>
               <div>
                 <label className="block text-sm font-medium mb-1">Agent Number</label>
-                <input type="text" className="w-full border px-3 py-2 rounded bg-gray-100" value={formData.agent_number} disabled />
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="\\d*"
+                  className="w-full border px-3 py-2 rounded bg-gray-100"
+                  value={(formData.agent_number || '').toString()}
+                  disabled
+                />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Name</label>

@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify, send_file
 from backend.db.connection import get_db_connection
+from backend.db.company_tables import get_company_table_name
 from backend.auth.jwt_utils import token_required
 from mysql.connector import Error
 import datetime
@@ -11,6 +12,26 @@ from openpyxl import load_workbook, Workbook
 import re
 
 calls_bp = Blueprint('calls', __name__)
+
+# Helpers to normalize and validate Indian mobile numbers
+def normalize_indian_mobile(raw: str) -> str:
+    """Return a 10-digit Indian mobile number by removing optional prefixes and non-digits.
+    Accepts formats like +91XXXXXXXXXX, 0XXXXXXXXXX, 91XXXXXXXXXX, and plain 10 digits.
+    """
+    if raw is None:
+        return ''
+    digits = re.sub(r'\D', '', str(raw))
+    # Strip leading 0 (0 + 10 digits)
+    if len(digits) == 11 and digits.startswith('0'):
+        digits = digits[1:]
+    # Strip country code 91 (91 + 10 digits)
+    if len(digits) == 12 and digits.startswith('91'):
+        digits = digits[2:]
+    return digits
+
+def is_valid_indian_mobile(ten_digits: str) -> bool:
+    """Basic validation: exactly 10 digits and starts with 6/7/8/9."""
+    return len(ten_digits) == 10 and ten_digits[0] in ('6', '7', '8', '9') and ten_digits.isdigit()
 
 @calls_bp.route('/api/calls', methods=['GET'])
 @token_required
@@ -30,6 +51,7 @@ def get_calls(current_user_id):
         data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
         role = data.get('role', 'admin')
         agent_number = data.get('agent_number', None)
+        company_id = data.get('company_id', None)
 
         # Date filter
         from_date = request.args.get('from')
@@ -58,26 +80,50 @@ def get_calls(current_user_id):
         except Exception:
             pass
 
-        # Build base query
-        base_query = (
-            "SELECT id, agent_number, customer_number, duration, call_status, timestamp, "
-            "remarks, name, remarks_status, (recordings IS NOT NULL) AS has_recording, alternative_numbers, "
-            "meeting_datetime, meeting_description FROM calls"
-        )
+        # Enforce company isolation and status restrictions
+        # If admin/agent, ensure company is Active for inbound; block outbound/export based on status on frontend via flags
+        company_status = 'Active'
+        payment_status = 'Paid'
+        if company_id and role in ('admin', 'agent'):
+            st = connection.cursor(dictionary=True)
+            st.execute("SELECT status, payment_status FROM companies WHERE id = %s", (company_id,))
+            row = st.fetchone()
+            if row:
+                company_status = row.get('status', 'Active')
+                payment_status = row.get('payment_status', 'Paid')
+            # If Fully Close, deny access entirely
+            if company_status == 'Fully Close' or payment_status == 'Unpaid':
+                return jsonify({'message': 'Access disabled for this company'}), 403
+
+        # Build base query, using per-company calls table when company_id is present
         where_clauses = []
         params = []
+        table_alias = 'c'
+        if role in ('admin', 'agent') and company_id:
+            calls_table = get_company_table_name('calls', int(company_id))
+            base_query = (
+                f"SELECT {table_alias}.id, {table_alias}.agent_number, {table_alias}.customer_number, {table_alias}.duration, {table_alias}.call_status, {table_alias}.timestamp, "
+                f"{table_alias}.remarks, {table_alias}.name, {table_alias}.remarks_status, ({table_alias}.recordings IS NOT NULL) AS has_recording, {table_alias}.alternative_numbers, "
+                f"{table_alias}.meeting_datetime, {table_alias}.meeting_description FROM `{calls_table}` {table_alias}"
+            )
+        else:
+            base_query = (
+                f"SELECT {table_alias}.id, {table_alias}.agent_number, {table_alias}.customer_number, {table_alias}.duration, {table_alias}.call_status, {table_alias}.timestamp, "
+                f"{table_alias}.remarks, {table_alias}.name, {table_alias}.remarks_status, ({table_alias}.recordings IS NOT NULL) AS has_recording, {table_alias}.alternative_numbers, "
+                f"{table_alias}.meeting_datetime, {table_alias}.meeting_description FROM calls {table_alias}"
+            )
         if role == 'agent' and agent_number:
-            where_clauses.append('agent_number = %s')
+            where_clauses.append(f'{table_alias}.agent_number = %s')
             params.append(agent_number)
         if from_date:
-            where_clauses.append('timestamp >= %s')
+            where_clauses.append(f'{table_alias}.timestamp >= %s')
             params.append(from_date + ' 00:00:00')
         if to_date:
-            where_clauses.append('timestamp <= %s')
+            where_clauses.append(f'{table_alias}.timestamp <= %s')
             params.append(to_date + ' 23:59:59')
         if where_clauses:
             base_query += ' WHERE ' + ' AND '.join(where_clauses)
-        base_query += ' ORDER BY timestamp DESC'
+        base_query += f' ORDER BY {table_alias}.timestamp DESC'
         cursor.execute(base_query, tuple(params))
         calls = cursor.fetchall()
         # Normalize timestamps and unify customer names within the same customer_number group
@@ -133,7 +179,22 @@ def update_call_custom_fields(current_user_id, call_id):
         cursor = connection.cursor(dictionary=True)
 
         # Fetch current values
-        cursor.execute("SELECT customer_number, remarks, name, remarks_status, alternative_numbers FROM calls WHERE id = %s", (call_id,))
+        # Determine per-company table from token
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        jwt_data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        company_id = jwt_data.get('company_id')
+        if company_id:
+            calls_table = get_company_table_name('calls', int(company_id))
+            cursor.execute(f"SELECT customer_number, remarks, name, remarks_status, alternative_numbers FROM `{calls_table}` WHERE id = %s", (call_id,))
+        else:
+            cursor.execute("SELECT customer_number, remarks, name, remarks_status, alternative_numbers FROM calls WHERE id = %s", (call_id,))
         call = cursor.fetchone()
         if not call:
             return jsonify({'message': 'Call not found'}), 404
@@ -153,28 +214,52 @@ def update_call_custom_fields(current_user_id, call_id):
         updated_remarks_status = concat(call.get('remarks_status', ''), remarks_status)
         updated_alternative_numbers = alternative_numbers if alternative_numbers else call.get('alternative_numbers', '')
         
-        cursor.execute(
-            """
-            UPDATE calls SET remarks=%s, name=%s, remarks_status=%s, alternative_numbers=%s,
-                   meeting_datetime=%s, meeting_description=%s
-            WHERE id=%s
-            """,
-            (
-                updated_remarks,
-                updated_name,
-                updated_remarks_status,
-                updated_alternative_numbers,
-                meeting_datetime,
-                meeting_description,
-                call_id,
-            ),
-        )
+        if company_id:
+            cursor.execute(
+                f"""
+                UPDATE `{calls_table}` SET remarks=%s, name=%s, remarks_status=%s, alternative_numbers=%s,
+                       meeting_datetime=%s, meeting_description=%s
+                WHERE id=%s
+                """,
+                (
+                    updated_remarks,
+                    updated_name,
+                    updated_remarks_status,
+                    updated_alternative_numbers,
+                    meeting_datetime,
+                    meeting_description,
+                    call_id,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE calls SET remarks=%s, name=%s, remarks_status=%s, alternative_numbers=%s,
+                       meeting_datetime=%s, meeting_description=%s
+                WHERE id=%s
+                """,
+                (
+                    updated_remarks,
+                    updated_name,
+                    updated_remarks_status,
+                    updated_alternative_numbers,
+                    meeting_datetime,
+                    meeting_description,
+                    call_id,
+                ),
+            )
         # If name changed, propagate to all rows for that customer
         if name and name.strip():
-            cursor.execute(
-                "UPDATE calls SET name=%s WHERE customer_number=%s",
-                (updated_name, call['customer_number']),
-            )
+            if company_id:
+                cursor.execute(
+                    f"UPDATE `{calls_table}` SET name=%s WHERE customer_number=%s",
+                    (updated_name, call['customer_number']),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE calls SET name=%s WHERE customer_number=%s",
+                    (updated_name, call['customer_number']),
+                )
         connection.commit()
         return jsonify({'message': 'Custom fields updated successfully'}), 200
     except Exception as e:
@@ -202,7 +287,22 @@ def download_call_recording(current_user_id, call_id):
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor()
-        cursor.execute("SELECT recordings FROM calls WHERE id=%s", (call_id,))
+        # Determine company
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        jwt_data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        company_id = jwt_data.get('company_id')
+        if company_id:
+            calls_table = get_company_table_name('calls', int(company_id))
+            cursor.execute(f"SELECT recordings FROM `{calls_table}` WHERE id=%s", (call_id,))
+        else:
+            cursor.execute("SELECT recordings FROM calls WHERE id=%s", (call_id,))
         row = cursor.fetchone()
         if not row or row[0] is None:
             return jsonify({'message': 'Recording not found'}), 404
@@ -241,8 +341,19 @@ def upload_call_corrections(current_user_id):
     Each item must include: agent_number, customer_number, name, remarks
     """
     try:
-        data = request.get_json() or {}
-        rows = data.get('rows', [])
+        body = request.get_json() or {}
+        rows = body.get('rows', [])
+        # Decode token to get company_id
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(' ')[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        jwt_data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        company_id = jwt_data.get('company_id')
         if not isinstance(rows, list) or not rows:
             return jsonify({'message': 'No rows provided'}), 400
 
@@ -272,21 +383,22 @@ def upload_call_corrections(current_user_id):
                 })
                 continue
 
-            digits_only = re.sub(r'\D', '', customer_number_raw)
-            if len(digits_only) != 10:
+            digits_only = normalize_indian_mobile(customer_number_raw)
+            if not is_valid_indian_mobile(digits_only):
                 errors.append({
                     'row': row_number,
                     'agent_number': effective_agent_number,
                     'customer_number': customer_number_raw,
                     'name': name,
                     'remarks': remarks,
-                    'reason': 'Customer number must be 10 digits'
+                    'reason': 'Invalid Indian mobile number'
                 })
                 continue
 
+            calls_table = get_company_table_name('calls', int(company_id))
             cursor.execute(
-                """
-                INSERT INTO calls (agent_number, customer_number, duration, call_status, timestamp, remarks, name, remarks_status)
+                f"""
+                INSERT INTO `{calls_table}` (agent_number, customer_number, duration, call_status, timestamp, remarks, name, remarks_status)
                 VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)
                 """,
                 (effective_agent_number, digits_only, 0, 'Uploaded', remarks, name, '')
@@ -320,13 +432,33 @@ def upload_call_recording(current_user_id, call_id):
         if connection is None:
             return jsonify({'message': 'Database connection failed'}), 500
         cursor = connection.cursor()
-        # Ensure column type
-        try:
-            cursor.execute("ALTER TABLE calls MODIFY recordings LONGBLOB")
-            connection.commit()
-        except Exception:
-            pass
-        cursor.execute("UPDATE calls SET recordings=%s WHERE id=%s", (data, call_id))
+        # Determine company
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(' ')[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        jwt_data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        company_id = jwt_data.get('company_id')
+        if company_id:
+            calls_table = get_company_table_name('calls', int(company_id))
+            # Ensure column type
+            try:
+                cursor.execute(f"ALTER TABLE `{calls_table}` MODIFY recordings LONGBLOB")
+                connection.commit()
+            except Exception:
+                pass
+            cursor.execute(f"UPDATE `{calls_table}` SET recordings=%s WHERE id=%s", (data, call_id))
+        else:
+            try:
+                cursor.execute("ALTER TABLE calls MODIFY recordings LONGBLOB")
+                connection.commit()
+            except Exception:
+                pass
+            cursor.execute("UPDATE calls SET recordings=%s WHERE id=%s", (data, call_id))
         connection.commit()
         return jsonify({'message': 'Recording uploaded'}), 200
     except Exception as e:
@@ -381,6 +513,7 @@ def upload_calls_excel(current_user_id):
         import jwt
         data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
         role = data.get('role', 'admin')
+        company_id = data.get('company_id')
         if role != 'admin':
             return jsonify({'message': 'Unauthorized'}), 403
 
@@ -448,7 +581,6 @@ def upload_calls_excel(current_user_id):
             remarks = cell_text(idx_remarks) if idx_remarks is not None else cell_text(2)
 
             # Validate required fields
-            # Validate required fields
             if not effective_agent_number or not customer_number:
                 errors.append({
                     'row': row_number,
@@ -460,22 +592,37 @@ def upload_calls_excel(current_user_id):
                 })
                 continue
 
-            # Ensure customer number is exactly 10 digits
-            digits_only = re.sub(r'\D', '', customer_number)
-            if len(digits_only) != 10:
+            # Normalize and validate Indian mobile number (10 digits, allow +91/0 prefixes)
+            digits_only = normalize_indian_mobile(customer_number)
+            if not is_valid_indian_mobile(digits_only):
                 errors.append({
                     'row': row_number,
                     'agent_number': effective_agent_number,
                     'customer_number': customer_number,
                     'name': name,
                     'remarks': remarks,
-                    'reason': 'Customer number must be 10 digits'
+                    'reason': 'Invalid Indian mobile number'
                 })
                 continue
 
+            # Ensure agent exists in this organization
+            agents_table = get_company_table_name('agents', int(company_id))
+            cursor.execute(f"SELECT 1 FROM `{agents_table}` WHERE agent_number = %s", (effective_agent_number,))
+            if cursor.fetchone() is None:
+                errors.append({
+                    'row': row_number,
+                    'agent_number': effective_agent_number,
+                    'customer_number': customer_number,
+                    'name': name,
+                    'remarks': remarks,
+                    'reason': 'Agent number not found in this organization'
+                })
+                continue
+
+            calls_table = get_company_table_name('calls', int(company_id))
             cursor.execute(
-                """
-                INSERT INTO calls (agent_number, customer_number, duration, call_status, timestamp, remarks, name, remarks_status)
+                f"""
+                INSERT INTO `{calls_table}` (agent_number, customer_number, duration, call_status, timestamp, remarks, name, remarks_status)
                 VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)
                 """,
                 (effective_agent_number, digits_only, 0, 'Uploaded', remarks, name, '')
@@ -510,9 +657,32 @@ def update_alternative_numbers(current_user_id, call_id):
         cursor = connection.cursor(dictionary=True)
 
         # Update alternative numbers
-        cursor.execute("""
-            UPDATE calls SET alternative_numbers=%s WHERE id=%s
-        """, (alternative_numbers, call_id))
+        # Determine company
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Token format invalid'}), 401
+        import jwt
+        jwt_data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        company_id = jwt_data.get('company_id')
+        if company_id:
+            calls_table = get_company_table_name('calls', int(company_id))
+            cursor.execute(
+                f"""
+                UPDATE `{calls_table}` SET alternative_numbers=%s WHERE id=%s
+                """,
+                (alternative_numbers, call_id)
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE calls SET alternative_numbers=%s WHERE id=%s
+                """,
+                (alternative_numbers, call_id)
+            )
         connection.commit()
         return jsonify({'message': 'Alternative numbers updated successfully'}), 200
     except Exception as e:

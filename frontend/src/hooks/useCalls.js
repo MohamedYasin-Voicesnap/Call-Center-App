@@ -33,6 +33,12 @@ export default function useCalls() {
     setEditLoading(false);
   };
 
+  const resetCalls = () => {
+    setCallDetails([]);
+    setEditingCallId(null);
+    setEditInputs({});
+  };
+
   return {
     callDetails,
     setCallDetails,
@@ -45,6 +51,7 @@ export default function useCalls() {
     setEditLoading,
     handleEditCall,
     handleCancelEdit,
-    handleUpdateCall
+    handleUpdateCall,
+    resetCalls,
   };
 }
