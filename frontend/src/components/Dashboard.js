@@ -129,7 +129,7 @@ const Dashboard = ({
             handleDateSearch={handleDateSearch}
             callSearch={callSearch}
             setCallSearch={setCallSearch}
-            showCallExport={activeTab === 'calls' && !isBlocked} // Only show export for active calls and if not blocked
+            showCallExport={showCallExport}
             setShowCallExport={setShowCallExport}
             filteredCalls={filteredCalls}
             exportToExcel={exportToExcel}

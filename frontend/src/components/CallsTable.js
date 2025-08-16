@@ -80,13 +80,24 @@ const CallsTable = ({
         setShowCallExport(false);
       }
     }
-    // Bind the event listener
-    document.addEventListener("mousedown", handleClickOutside);
+
+    if (showCallExport) {
+      // Add a small delay to attach the event listener
+      // This prevents the immediate closing due to the same click that opened it
+      const timeoutId = setTimeout(() => {
+        document.addEventListener("mouseup", handleClickOutside);
+      }, 0); // 0ms delay defers to next event loop tick
+
+      return () => {
+        clearTimeout(timeoutId);
+        document.removeEventListener("mouseup", handleClickOutside);
+      };
+    }
+
     return () => {
-      // Unbind the event listener on clean up
-      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("mouseup", handleClickOutside); // Ensure it's removed if showCallExport becomes false
     };
-  }, [exportDropdownRef, setShowCallExport]);
+  }, [exportDropdownRef, setShowCallExport, showCallExport]); // Add showCallExport to dependencies
 
   const formatTime = (sec = 0) => {
     const s = Math.floor(sec % 60).toString().padStart(2, '0');
@@ -140,7 +151,8 @@ const CallsTable = ({
         <input type="text" placeholder="Search calls..." value={callSearch} onChange={e => setCallSearch(e.target.value)} className="border px-3 py-1 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 ml-4" style={{ width: 180 }} />
         <CompanyExportGuard isBlocked={isBlocked}>
           <div className="relative ml-2" ref={exportDropdownRef}>
-            <button onClick={() => {
+            <button onClick={(e) => {
+              e.stopPropagation(); // Prevent the click from immediately closing the dropdown via handleClickOutside
               console.log("CallsTable.js - Export button clicked. Current showCallExport:", showCallExport);
               setShowCallExport(v => !v);
             }} className="flex items-center bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600" style={{ minWidth: 90 }}>
